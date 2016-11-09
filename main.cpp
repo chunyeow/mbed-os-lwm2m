@@ -60,6 +60,24 @@ NanostackRfPhyMcr20a rf_phy(MCR20A_SPI_MOSI, MCR20A_SPI_MISO, MCR20A_SPI_SCLK, M
 #define MBED_SERVER_ADDRESS "coaps://[2607:f0d0:2601:52::20]:5684"
 #endif
 
+#ifdef SIM5215
+DigitalOut modem_en(PTD3);
+DigitalOut modem_rts(PTD2);
+DigitalOut modem_dtr(PTD0);
+Serial modem(PTC17, PTC16);
+char READ_BUF[100];
+// Modem UART related declarations
+volatile int rx_in=0;
+volatile int rx_out=0;
+const int buffer_size = 255;
+char rx_buffer[buffer_size+1];
+char rx_line[buffer_size];
+// HTTP related declarations
+char HTTPPage[15] = "";
+uint16_t HTTPPort = 8881;
+char Operator[10] = ""; // celcom4g, diginet
+#endif
+
 Serial output(USBTX, USBRX);
 
 // Status indication
@@ -344,6 +362,74 @@ void trace_printer(const char* str) {
     printf("%s\r\n", str);
 }
 
+#ifdef SIM5215
+/* The following codes are retrieve from the Skywire_Kinetis_K64_demo
+ */
+void modem_rx_interrupt() {
+// Loop just in case more than one character is in UART's receive FIFO buffer
+// Stop if buffer full
+    while ((modem.readable()) && (((rx_in + 1) % buffer_size) != rx_out)) {
+        rx_buffer[rx_in] = modem.getc();
+        rx_in = (rx_in + 1) % buffer_size;
+    }
+    return;
+}
+
+// Read Line
+void read_line() {
+    int i;
+    i = 0;
+    // Start Critical Section - don't interrupt while changing global buffer variables
+    __disable_irq();
+    // Loop reading rx buffer characters until end of line character
+    while ((i==0) || (rx_line[i-1] != '\n')) {
+    // Wait if buffer empty
+        if (rx_in == rx_out) {
+            // End Critical Section - need to allow rx interrupt to get new characters for buffer
+            __enable_irq();
+            while (rx_in == rx_out) {
+              //pc.printf("..Read_line entered2.5\r\n");
+            }
+            // Start Critical Section - don't interrupt while changing global buffer variables
+            __disable_irq();
+        }
+        rx_line[i] = rx_buffer[rx_out];
+        i++;
+        rx_out = (rx_out + 1) % buffer_size;
+    }
+    // End Critical Section
+    __enable_irq();
+    rx_line[i-1] = 0;
+    return;
+}
+
+// UART response
+int WaitForResponse(char* response, int num) {
+    do {
+        read_line();
+        output.printf("Waiting for: %s, Recieved: %s\r\n", response, rx_line);
+    } while (strncmp(rx_line, response, num));
+    return 0;
+}
+
+// Blink the LED
+void blinkRG(int blinkduration)
+{
+    // blinkduration is measured in seconds
+    red_led = 1;
+    green_led = 0;
+    while (blinkduration-- >= 1){
+        red_led = green_led;
+        green_led =!red_led;
+        wait(1);
+    }
+    // leave the function with LEDs both off
+    red_led = 1;
+    green_led = 1;
+
+}
+#endif
+
 // Entry point to the program
 int main() {
 
@@ -379,6 +465,58 @@ Add MBEDTLS_NO_DEFAULT_ENTROPY_SOURCES and MBEDTLS_TEST_NULL_ENTROPY in mbed_app
     output.baud(115200);
 
     output.printf("Starting mbed Client example...\r\n");
+
+#ifdef SIM5215
+    // turn on 3g modem
+    modem_en = 1;
+
+    // setup 3g modem UART
+    modem_rts=0;
+    modem_dtr=0;
+    modem.baud(115200);
+    modem.format(8, Serial::None, 1);
+
+    // setup 3g modem UART interrupt
+    modem.attach(&modem_rx_interrupt, modem.RxIrq);
+
+    // wait 10 seconds for modem to boot up and connect to network
+    blinkRG(10);
+    output.printf("Wait for modem to be ready\r\n");
+
+    //Turn off echo
+    modem.printf("ATE0\r\n");
+    WaitForResponse("OK", 2);
+    output.printf("Turn off echo in 3G modem\r\n");
+
+    // check network registration status
+    modem.printf("AT+CREG?\r\n");
+    WaitForResponse("+CREG: 0,1", 10);
+    output.printf("2G/3G network registered\r\n");
+
+    // check GPRS network registraion status
+    modem.printf("AT+CGREG?\r\n");
+    WaitForResponse("+CGREG: 0,1", 11);
+    output.printf("GPRS network registered\r\n");
+
+    // set APN
+    modem.printf("AT+CGSOCKCONT=1,\"IP\",\"%s\"\r\n", Operator);
+    WaitForResponse("OK", 2);
+    output.printf("Set APN to \"%s\"\r\n", Operator);
+
+#ifdef SIM5215_GET
+    // HTTP Request
+    const char* HTTP_request = "GET /test.html HTTP/1.1\r\nHost: www.iot.com.my\r\nContent-Length: 0\r\n\r\n";
+    modem.printf("AT+CHTTPACT=\"%s\",%u\r\n", HTTPPage, HTTPPort);
+    WaitForResponse("+CHTTPACT: REQUEST", 18);
+    for (uint16_t x=0 ; x < strlen(HTTP_request); x++)
+    {
+           modem.putc(HTTP_request[x]);
+    }
+    modem.putc(0x1A);
+    WaitForResponse("+CHTTPACT: 0", 12);
+    output.printf("HTTP request sent\r\n");
+#endif
+#endif
 
     mbed_trace_init();
     mbed_trace_print_function_set(trace_printer);
